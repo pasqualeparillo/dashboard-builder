@@ -1,0 +1,75 @@
+'version': 1
+'metadata':
+  'slug': 'new-dashboard'
+  'title': 'New Dashboard'
+  'updated_at': '2026-03-26T12:44:57.840Z'
+'datasets': []
+'filters': []
+'widgets':
+  - 'id': 'line-chart-9ea6e83a-fcf7-4806-8b05-a2fb7425812f'
+    'type': 'line-chart'
+    'props':
+      'title': 'Line Chart'
+      'refresh_ms': 30000
+      'dataset_id': null
+      'description': ''
+      'text_content': ''
+      'show_title': true
+      'show_description': false
+      'coordinates':
+        'x_field': null
+        'y_field': null
+        'color_field': null
+        'value_field': null
+  - 'id': 'data-table-fd6e3991-e0d8-467a-a58e-d9e2e46e721a'
+    'type': 'data-table'
+    'props':
+      'title': 'Data Table'
+      'refresh_ms': 30000
+      'dataset_id': null
+      'description': ''
+      'text_content': ''
+      'show_title': true
+      'show_description': false
+      'coordinates':
+        'x_field': null
+        'y_field': null
+        'color_field': null
+        'value_field': null
+  - 'id': 'metric-gauge-48ea46c6-76ed-4035-a69c-af57824f44cf'
+    'type': 'metric-gauge'
+    'props':
+      'title': 'Metric Gauge'
+      'refresh_ms': 30000
+      'dataset_id': null
+      'description': ''
+      'text_content': ''
+      'show_title': true
+      'show_description': false
+      'coordinates':
+        'x_field': null
+        'y_field': null
+        'color_field': null
+        'value_field': null
+'layout':
+  - 'i': 'line-chart-9ea6e83a-fcf7-4806-8b05-a2fb7425812f'
+    'x': 0
+    'y': 0
+    'w': 5
+    'h': 7
+    'min_w': 4
+    'min_h': 5
+  - 'i': 'data-table-fd6e3991-e0d8-467a-a58e-d9e2e46e721a'
+    'x': 5
+    'y': 0
+    'w': 5
+    'h': 7
+    'min_w': 4
+    'min_h': 5
+  - 'i': 'metric-gauge-48ea46c6-76ed-4035-a69c-af57824f44cf'
+    'x': 0
+    'y': 7
+    'w': 4
+    'h': 7
+    'min_w': 4
+    'min_h': 5
