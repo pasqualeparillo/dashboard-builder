@@ -1,0 +1,132 @@
+name: Validate And Deploy Changed Dashboards
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'dashboards/**/dashboard.yaml'
+      - '.github/workflows/deploy-dashboard.yml'
+  workflow_dispatch:
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.collect.outputs.matrix }}
+      has_changes: ${{ steps.collect.outputs.has_changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect changed dashboard slugs
+        id: collect
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            mapfile -t files < <(git ls-files 'dashboards/*/dashboard.yaml')
+          else
+            BEFORE="${{ github.event.before }}"
+            if [[ -z "$BEFORE" || "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+              mapfile -t files < <(git ls-files 'dashboards/*/dashboard.yaml')
+            else
+              mapfile -t files < <(git diff --name-only "$BEFORE" "${{ github.sha }}" -- 'dashboards/*/dashboard.yaml')
+            fi
+          fi
+
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo 'matrix=[]' >> "$GITHUB_OUTPUT"
+            echo 'has_changes=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          matrix_json=$(printf '%s
+
+          echo "matrix=${matrix_json}" >> "$GITHUB_OUTPUT"
+          echo 'has_changes=true' >> "$GITHUB_OUTPUT"
+
+  validate:
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.has_changes == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        slug: ${{ fromJson(needs.detect.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install YAML dependency
+        run: pip install pyyaml
+
+      - name: Validate YAML schema
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib
+          import sys
+          import yaml
+
+          slug = "${{ matrix.slug }}"
+          path = pathlib.Path(f"dashboards/{slug}/dashboard.yaml")
+          if not path.exists():
+            print(f"Missing YAML for slug={slug}: {path}", file=sys.stderr)
+            sys.exit(1)
+
+          data = yaml.safe_load(path.read_text(encoding="utf-8"))
+          required = ["version", "metadata", "datasets", "widgets", "layout"]
+          for field in required:
+            if field not in data:
+              print(f"{path}: missing required field '{field}'", file=sys.stderr)
+              sys.exit(1)
+
+          if data["version"] != 1:
+            print(f"{path}: version must be 1", file=sys.stderr)
+            sys.exit(1)
+
+          metadata = data.get("metadata") or {}
+          if metadata.get("slug") != slug:
+            print(
+              f"{path}: metadata.slug must match folder slug '{slug}', got '{metadata.get('slug')}'",
+              file=sys.stderr,
+            )
+            sys.exit(1)
+
+          widget_ids = {w.get("id") for w in data.get("widgets", [])}
+          layout_ids = {l.get("i") for l in data.get("layout", [])}
+          if widget_ids != layout_ids:
+            print(f"{path}: widget ids and layout ids do not match", file=sys.stderr)
+            sys.exit(1)
+
+          print(f"Validated {path}")
+          PY
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [detect, validate]
+    if: needs.detect.outputs.has_changes == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        slug: ${{ fromJson(needs.detect.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Databricks CLI
+        uses: databricks/setup-cli@main
+
+      - name: Update shared runtime config for changed dashboard
+        shell: bash
+        run: |
+          echo "Deploying config for slug=${{ matrix.slug }}"
+          echo "Source: dashboards/${{ matrix.slug }}/dashboard.yaml"
+          echo "TODO: publish YAML into shared runtime config store (Volume/Delta table), then trigger runtime refresh."
