@@ -24,5 +24,8 @@ dist-ssr
 *.sln
 *.sw?
 
+*.pyc
+__pycache__/
+.pytest_cache/
 *storybook.log
 storybook-static

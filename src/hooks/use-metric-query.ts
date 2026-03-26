@@ -34,11 +34,11 @@ export function useMetricQuery(sql: string, refreshMs: number) {
         }
       } catch (error) {
         if (!cancelled) {
-          setState({
-            data: [],
+          setState((previous) => ({
+            data: previous.data,
             loading: false,
             error: error instanceof Error ? error.message : 'Unknown query error',
-          })
+          }))
         }
       }
     }

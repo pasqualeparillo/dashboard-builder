@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -44,6 +45,27 @@ class EmbeddedDashboardResponse(BaseModel):
 
 app = FastAPI(title="Dashboard Builder Backend")
 
+
+def _load_local_env_file() -> None:
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_local_env_file()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -58,13 +80,62 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/query")
-async def query_metrics(payload: QueryRequest) -> dict[str, Any]:
+async def _execute_sql_statement(statement: str) -> dict[str, Any]:
     host = os.getenv("DATABRICKS_HOST", "")
     token = os.getenv("DATABRICKS_TOKEN", "")
     warehouse_id = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
 
     if not host or not token or not warehouse_id:
+        raise ValueError("missing_databricks_config")
+
+    endpoint = f"{host.rstrip('/')}/api/2.0/sql/statements/"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "warehouse_id": warehouse_id,
+        "statement": statement,
+        "wait_timeout": "20s",
+        "disposition": "INLINE",
+        "format": "JSON_ARRAY",
+    }
+
+    max_wait_seconds = int(os.getenv("DATABRICKS_STATEMENT_MAX_WAIT_SECONDS", "45"))
+    poll_interval_seconds = float(os.getenv("DATABRICKS_STATEMENT_POLL_INTERVAL_SECONDS", "1.5"))
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(endpoint, headers=headers, json=body)
+        if response.status_code >= 400:
+            raise HTTPException(status_code=response.status_code, detail=response.text)
+
+        data = response.json()
+        state = str(data.get("status", {}).get("state", ""))
+        statement_id = data.get("statement_id")
+
+        elapsed = 0.0
+        while state in {"PENDING", "RUNNING"} and statement_id and elapsed < max_wait_seconds:
+            await asyncio.sleep(poll_interval_seconds)
+            elapsed += poll_interval_seconds
+
+            poll_response = await client.get(f"{endpoint}{statement_id}", headers=headers)
+            if poll_response.status_code >= 400:
+                raise HTTPException(status_code=poll_response.status_code, detail=poll_response.text)
+
+            data = poll_response.json()
+            state = str(data.get("status", {}).get("state", ""))
+
+    if state != "SUCCEEDED":
+        raise HTTPException(status_code=400, detail=f"Statement state is {state}")
+
+    return data
+
+
+@app.post("/api/query")
+async def query_metrics(payload: QueryRequest) -> dict[str, Any]:
+    try:
+        data = await _execute_sql_statement(payload.sql)
+    except ValueError:
         return {
             "rows": [
                 {
@@ -80,33 +151,6 @@ async def query_metrics(payload: QueryRequest) -> dict[str, Any]:
             ],
             "mode": "mock",
         }
-
-    endpoint = f"{host.rstrip('/')}/api/2.0/sql/statements/"
-    body = {
-        "warehouse_id": warehouse_id,
-        "statement": payload.sql,
-        "wait_timeout": "20s",
-        "disposition": "INLINE",
-        "format": "JSON_ARRAY",
-    }
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            endpoint,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json=body,
-        )
-
-    if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=response.text)
-
-    data = response.json()
-    state = data.get("status", {}).get("state")
-    if state != "SUCCEEDED":
-        raise HTTPException(status_code=400, detail=f"Statement state is {state}")
 
     columns = data.get("manifest", {}).get("schema", {}).get("columns", [])
     rows = data.get("result", {}).get("data_array", [])
@@ -137,10 +181,6 @@ async def query_metrics(payload: QueryRequest) -> dict[str, Any]:
 
 @app.post("/api/validate-query", response_model=ValidateQueryResponse)
 async def validate_query(payload: QueryRequest) -> ValidateQueryResponse:
-    host = os.getenv("DATABRICKS_HOST", "")
-    token = os.getenv("DATABRICKS_TOKEN", "")
-    warehouse_id = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
-
     if not payload.sql.strip():
         return ValidateQueryResponse(
             valid=False,
@@ -148,7 +188,7 @@ async def validate_query(payload: QueryRequest) -> ValidateQueryResponse:
             columns=[],
         )
 
-    if not host or not token or not warehouse_id:
+    if not os.getenv("DATABRICKS_HOST", "") or not os.getenv("DATABRICKS_TOKEN", "") or not os.getenv("DATABRICKS_WAREHOUSE_ID", ""):
         return ValidateQueryResponse(
             valid=True,
             message="Mock validation succeeded. Configure Databricks env vars for live validation.",
@@ -159,40 +199,15 @@ async def validate_query(payload: QueryRequest) -> ValidateQueryResponse:
             ],
         )
 
-    endpoint = f"{host.rstrip('/')}/api/2.0/sql/statements/"
-    statement = f"SELECT * FROM ({payload.sql}) AS validated_query LIMIT 1"
-    body = {
-        "warehouse_id": warehouse_id,
-        "statement": statement,
-        "wait_timeout": "20s",
-        "disposition": "INLINE",
-        "format": "JSON_ARRAY",
-    }
+    normalized_sql = payload.sql.strip().rstrip(";").strip()
+    statement = f"SELECT * FROM ({normalized_sql}) AS validated_query LIMIT 1"
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            endpoint,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json=body,
-        )
-
-    if response.status_code >= 400:
-        detail = response.text
+    try:
+        data = await _execute_sql_statement(statement)
+    except HTTPException as exc:
         return ValidateQueryResponse(
             valid=False,
-            message=f"Validation failed: {detail}",
-            columns=[],
-        )
-
-    data = response.json()
-    state = data.get("status", {}).get("state")
-    if state != "SUCCEEDED":
-        return ValidateQueryResponse(
-            valid=False,
-            message=f"Validation failed with statement state: {state}",
+            message=f"Validation failed: {exc.detail}",
             columns=[],
         )
 
@@ -289,6 +304,7 @@ def _to_saved_dashboard_layout(spec: dict[str, Any]) -> dict[str, Any]:
                         "yField": widget.get("props", {}).get("coordinates", {}).get("y_field") or None,
                         "colorField": widget.get("props", {}).get("coordinates", {}).get("color_field") or None,
                         "valueField": widget.get("props", {}).get("coordinates", {}).get("value_field") or None,
+                        "tableColumns": widget.get("props", {}).get("coordinates", {}).get("table_columns") or [],
                     },
                 },
             }

@@ -6,3 +6,7 @@ export function slugify(value: string) {
     .replace(/\s+/g, '-')
     .replace(/-+/g, '-')
 }
+
+export function createDashboardSlug(prefix = 'dashboard') {
+  return `${slugify(prefix) || 'dashboard'}-${crypto.randomUUID()}`
+}

@@ -22,3 +22,9 @@ export default meta
 type Story = StoryObj<typeof meta>
 
 export const Default: Story = {}
+
+export const SelectedColumns: Story = {
+  args: {
+    visibleColumns: ['metric_name', 'metric_value'],
+  },
+}

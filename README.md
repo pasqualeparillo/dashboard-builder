@@ -152,6 +152,8 @@ Run backend:
 npm run backend:dev
 ```
 
+The backend command loads `.env` automatically, so Databricks credentials are picked up for live query mode.
+
 ## Save behavior
 
 When you click **Save Dashboard**, the app serializes:

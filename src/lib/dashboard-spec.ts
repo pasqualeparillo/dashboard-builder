@@ -91,6 +91,7 @@ export function toDashboardSpec(layout: SavedDashboardLayout): DashboardSpecV1 {
           y_field: item.props.coordinates.yField ?? null,
           color_field: item.props.coordinates.colorField ?? null,
           value_field: item.props.coordinates.valueField ?? null,
+          table_columns: item.props.coordinates.tableColumns ?? [],
         },
       },
     })),
@@ -165,6 +166,7 @@ export function fromDashboardSpec(spec: DashboardSpecV1): SavedDashboardLayout {
           yField: widget.props.coordinates.y_field ?? undefined,
           colorField: widget.props.coordinates.color_field ?? undefined,
           valueField: widget.props.coordinates.value_field ?? undefined,
+          tableColumns: widget.props.coordinates.table_columns ?? [],
         },
       },
     })),
@@ -260,6 +262,9 @@ function parseDashboardSpec(input: unknown): DashboardSpecV1 {
               coordinates.value_field === null || typeof coordinates.value_field === 'string'
                 ? coordinates.value_field
                 : null,
+            table_columns: Array.isArray(coordinates.table_columns)
+              ? coordinates.table_columns.filter((entry): entry is string => typeof entry === 'string')
+              : [],
           },
         },
       }

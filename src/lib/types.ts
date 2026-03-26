@@ -19,6 +19,7 @@ export interface VizCoordinates {
   yField?: string
   colorField?: string
   valueField?: string
+  tableColumns?: string[]
 }
 
 export interface VizProps {
@@ -87,6 +88,7 @@ export interface DashboardSpecV1 {
         y_field: string | null
         color_field: string | null
         value_field: string | null
+        table_columns: string[]
       }
     }
   }>

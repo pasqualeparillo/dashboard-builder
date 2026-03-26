@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
+import { AnimatePresence, motion } from 'framer-motion'
+import * as Popover from '@radix-ui/react-popover'
 import GridLayout, { noCompactor, type LayoutItem } from 'react-grid-layout'
 import {
   Copy,
   ChevronLeft,
+  ChevronDown,
   ChevronRight,
   Check,
   Database,
@@ -29,9 +32,14 @@ import {
 import { createDefaultItem, DEFAULT_SQL, toSavedLayout } from '@/lib/dashboard'
 import { createYamlRecord, parseDashboardYaml } from '@/lib/dashboard-spec'
 import { createEmbedToken, fetchEmbedDashboard } from '@/lib/embed'
-import { saveDashboardLayout } from '@/lib/github'
+import {
+  deleteDashboardLayout,
+  listDashboardLayoutsFromGithub,
+  saveDashboardLayout,
+} from '@/lib/github'
+import { useMetricQuery } from '@/hooks/use-metric-query'
 import { validateDatasetSql } from '@/lib/metrics'
-import { slugify } from '@/lib/slug'
+import { createDashboardSlug, slugify } from '@/lib/slug'
 import type {
   DashboardItem,
   DatasetDefinition,
@@ -124,6 +132,61 @@ function upsertSavedLayout(
 ): SavedDashboardLayout[] {
   const next = [layout, ...existing.filter((entry) => entry.slug !== layout.slug)]
   return next.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+}
+
+function ensureUniqueSlug(baseSlug: string, takenSlugs: Set<string>, preserveSlug?: string | null) {
+  const normalizedPreserve = preserveSlug ? slugify(preserveSlug) : null
+  if (!baseSlug) {
+    return ''
+  }
+
+  if (!takenSlugs.has(baseSlug) || normalizedPreserve === baseSlug) {
+    return baseSlug
+  }
+
+  let index = 2
+  let candidate = `${baseSlug}-${index}`
+  while (takenSlugs.has(candidate)) {
+    index += 1
+    candidate = `${baseSlug}-${index}`
+  }
+
+  return candidate
+}
+
+function ensureUniqueDashboardSlug(takenSlugs: Set<string>, preserveSlug?: string | null) {
+  const normalizedPreserve = preserveSlug ? slugify(preserveSlug) : null
+  let attempts = 0
+
+  while (attempts < 20) {
+    const candidate = createDashboardSlug()
+    if (!takenSlugs.has(candidate) || normalizedPreserve === candidate) {
+      return candidate
+    }
+    attempts += 1
+  }
+
+  return ensureUniqueSlug(createDashboardSlug(), takenSlugs, preserveSlug)
+}
+
+function mergeLocalAndRemoteDashboards(
+  localDashboards: SavedDashboardLayout[],
+  remoteDashboards: SavedDashboardLayout[],
+) {
+  const merged = new Map<string, SavedDashboardLayout>()
+
+  for (const dashboard of localDashboards) {
+    merged.set(dashboard.slug, dashboard)
+  }
+
+  for (const dashboard of remoteDashboards) {
+    const existing = merged.get(dashboard.slug)
+    if (!existing || dashboard.updatedAt > existing.updatedAt) {
+      merged.set(dashboard.slug, dashboard)
+    }
+  }
+
+  return [...merged.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
 }
 
 interface BuilderSnapshot {
@@ -354,10 +417,32 @@ function isTextEntryTarget(target: EventTarget | null) {
   )
 }
 
+function mergeUniqueColumns(values: string[]) {
+  const deduped = new Set<string>()
+  for (const value of values) {
+    const next = value.trim()
+    if (next) {
+      deduped.add(next)
+    }
+  }
+  return [...deduped]
+}
+
+function getFieldTypeLabel(type: string) {
+  const normalized = type.toLowerCase()
+  if (normalized.includes('int') || normalized.includes('double') || normalized.includes('decimal') || normalized.includes('number')) {
+    return '123'
+  }
+  if (normalized.includes('date') || normalized.includes('time')) {
+    return 'T'
+  }
+  return 'ABC'
+}
+
 function App() {
   const [viewMode, setViewMode] = useState<ViewMode>('builder')
   const [dashboardTitle, setDashboardTitle] = useState('New Dashboard')
-  const [dashboardSlug, setDashboardSlug] = useState('new-dashboard')
+  const [dashboardSlug, setDashboardSlug] = useState(() => createDashboardSlug())
   const [items, setItems] = useState<DashboardItem[]>([])
   const [layout, setLayout] = useState<LayoutItem[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -365,8 +450,12 @@ function App() {
   const [showDatasetEditor, setShowDatasetEditor] = useState(false)
   const [datasetName, setDatasetName] = useState('')
   const [datasetSql, setDatasetSql] = useState(DEFAULT_SQL)
+  const [datasetPreviewSql, setDatasetPreviewSql] = useState('')
+  const [hasRunDatasetPreview, setHasRunDatasetPreview] = useState(false)
   const [datasetStatus, setDatasetStatus] = useState('')
   const [isValidatingDataset, setIsValidatingDataset] = useState(false)
+  const [datasetPreviewLimit, setDatasetPreviewLimit] = useState(5)
+  const [draggingTableColumn, setDraggingTableColumn] = useState<string | null>(null)
   const [saveStatus, setSaveStatus] = useState('')
   const [isSaving, setIsSaving] = useState(false)
   const [hasSavedToGithub, setHasSavedToGithub] = useState(false)
@@ -390,12 +479,19 @@ function App() {
     readSavedLayoutsFromStorage(),
   )
   const [activePreviewSlug, setActivePreviewSlug] = useState<string | null>(null)
+  const [previewDashboardOverride, setPreviewDashboardOverride] = useState<SavedDashboardLayout | null>(null)
   const [embedStatus, setEmbedStatus] = useState('')
   const [isCreatingEmbed, setIsCreatingEmbed] = useState(false)
+  const [isActionsMenuOpen, setIsActionsMenuOpen] = useState(false)
+  const [isSyncingFromGithub, setIsSyncingFromGithub] = useState(false)
+  const [lastGithubSyncAt, setLastGithubSyncAt] = useState<string | null>(null)
+  const [githubSyncStatus, setGithubSyncStatus] = useState('')
   const [embeddedDashboard, setEmbeddedDashboard] = useState<SavedDashboardLayout | null>(null)
   const [embedLoadError, setEmbedLoadError] = useState('')
   const gridContainerRef = useRef<HTMLDivElement | null>(null)
   const previewGridContainerRef = useRef<HTMLDivElement | null>(null)
+  const importYamlInputRef = useRef<HTMLInputElement | null>(null)
+  const isSyncingFromGithubRef = useRef(false)
   const activeInteractionIdRef = useRef<string | null>(null)
   const panelTransitionTimeoutRef = useRef<number | null>(null)
   const [previewGridWidth, setPreviewGridWidth] = useState(930)
@@ -421,13 +517,44 @@ function App() {
     return datasets.find((entry) => entry.id === selectedItem.props.datasetId) ?? null
   }, [datasets, selectedItem])
 
-  const datasetColumns = selectedDataset?.columns ?? []
+  const selectedDatasetRefreshMs = selectedItem?.props.refreshMs ?? 30000
+  const {
+    data: selectedDatasetRows,
+    loading: selectedDatasetLoading,
+    error: selectedDatasetError,
+  } = useMetricQuery(selectedDataset?.sql ?? '', selectedDatasetRefreshMs)
+  const inferredSelectedDatasetColumns = useMemo(
+    () => Object.keys(selectedDatasetRows[0] ?? {}).map((name) => ({ name, type: 'UNKNOWN' })),
+    [selectedDatasetRows],
+  )
+
+  const datasetColumns =
+    selectedDataset?.columns.length && selectedDataset.columns.length > 0
+      ? selectedDataset.columns
+      : inferredSelectedDatasetColumns
+  const datasetFieldNames = useMemo(() => datasetColumns.map((column) => column.name), [datasetColumns])
+  const {
+    data: datasetPreviewRows,
+    loading: datasetPreviewLoading,
+    error: datasetPreviewError,
+  } = useMetricQuery(showDatasetEditor ? datasetPreviewSql : '', 60000)
+  const datasetPreviewColumns = useMemo(() => Object.keys(datasetPreviewRows[0] ?? {}), [datasetPreviewRows])
+  const datasetPreviewDisplayRows = useMemo(
+    () => datasetPreviewRows.slice(0, Math.max(1, Math.min(datasetPreviewLimit, 50))),
+    [datasetPreviewLimit, datasetPreviewRows],
+  )
+  const canSaveDataset =
+    hasRunDatasetPreview && !datasetPreviewLoading && !datasetPreviewError && datasetPreviewColumns.length > 0
   const requiredAxis = selectedItem ? typeAxisRules[selectedItem.type].required : []
   const missingRequiredAxis = selectedItem
     ? requiredAxis.filter(
         (key) => !selectedItem.props.coordinates[key as keyof typeof selectedItem.props.coordinates],
       )
     : []
+  const selectedTableColumns = useMemo(
+    () => selectedItem?.props.coordinates.tableColumns ?? [],
+    [selectedItem],
+  )
   const maxCanvasHeight = CANVAS_PAGES * viewportHeight
   const maxGridRows = Math.floor(maxCanvasHeight / (ROW_HEIGHT + GRID_MARGIN[1]))
   const canvasHeight = getCanvasHeightPx(layout, viewportHeight, maxCanvasHeight)
@@ -440,20 +567,60 @@ function App() {
   const gridPitchX = gridCellWidth + GRID_MARGIN[0]
   const gridPitchY = ROW_HEIGHT + GRID_MARGIN[1]
   const activePreviewDashboard = useMemo(() => {
+    if (previewDashboardOverride) {
+      return previewDashboardOverride
+    }
+
     if (!activePreviewSlug) {
       return null
     }
 
     return savedDashboards.find((entry) => entry.slug === activePreviewSlug) ?? null
-  }, [savedDashboards, activePreviewSlug])
-  const hasSavedCurrentDashboard = useMemo(() => {
-    const cleanSlug = slugify(dashboardSlug)
-    if (!cleanSlug) {
-      return false
-    }
+  }, [savedDashboards, activePreviewSlug, previewDashboardOverride])
+  const canPreviewCurrent = items.length > 0
 
-    return savedDashboards.some((entry) => entry.slug === cleanSlug)
-  }, [dashboardSlug, savedDashboards])
+  const syncDashboardsFromGithub = useCallback(
+    async (showStatus = false) => {
+      if (isSyncingFromGithubRef.current) {
+        return
+      }
+
+      isSyncingFromGithubRef.current = true
+      setIsSyncingFromGithub(true)
+      if (showStatus) {
+        setGithubSyncStatus('Syncing dashboards from GitHub...')
+      }
+
+      try {
+        const remoteDashboards = await listDashboardLayoutsFromGithub()
+
+        setSavedDashboards((current) => {
+          const merged = mergeLocalAndRemoteDashboards(current, remoteDashboards)
+          writeSavedLayoutsToStorage(merged)
+          return merged
+        })
+
+        const syncedAt = new Date().toISOString()
+        setLastGithubSyncAt(syncedAt)
+        if (showStatus) {
+          setGithubSyncStatus(
+            remoteDashboards.length
+              ? `Synced ${remoteDashboards.length} dashboard${remoteDashboards.length === 1 ? '' : 's'} from GitHub.`
+              : 'GitHub sync complete. No dashboards found in repo.',
+          )
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown GitHub sync error'
+        if (showStatus) {
+          setGithubSyncStatus(`GitHub sync failed: ${message}`)
+        }
+      } finally {
+        setIsSyncingFromGithub(false)
+        isSyncingFromGithubRef.current = false
+      }
+    },
+    [],
+  )
 
   useEffect(() => {
     if (viewMode !== 'builder') {
@@ -553,6 +720,10 @@ function App() {
       }
     }
   }, [])
+
+  useEffect(() => {
+    void syncDashboardsFromGithub(false)
+  }, [syncDashboardsFromGithub])
 
   const startPanelTransition = () => {
     setIsPanelTransitioning(true)
@@ -832,6 +1003,16 @@ function App() {
       return
     }
 
+    if (!hasRunDatasetPreview) {
+      setDatasetStatus('Run the query preview before saving this dataset.')
+      return
+    }
+
+    if (!canSaveDataset) {
+      setDatasetStatus('Run a successful preview before saving this dataset.')
+      return
+    }
+
     setIsValidatingDataset(true)
     setDatasetStatus('Validating SQL...')
 
@@ -852,6 +1033,8 @@ function App() {
       setDatasetStatus(validation.message)
       setDatasetName('')
       setDatasetSql(DEFAULT_SQL)
+      setDatasetPreviewSql('')
+      setHasRunDatasetPreview(false)
       setShowDatasetEditor(false)
     } catch (error) {
       setDatasetStatus(error instanceof Error ? error.message : 'Dataset validation failed.')
@@ -860,27 +1043,58 @@ function App() {
     }
   }
 
+  const runDatasetPreview = () => {
+    if (!datasetSql.trim()) {
+      setDatasetStatus('Dataset SQL is required.')
+      return
+    }
+
+    setDatasetStatus('')
+    setHasRunDatasetPreview(true)
+    setDatasetPreviewSql(datasetSql)
+  }
+
   const handleSave = async () => {
-    const cleanSlug = slugify(dashboardSlug)
-    if (!cleanSlug) {
+    const requestedSlug = slugify(dashboardSlug)
+    if (!requestedSlug) {
       setSaveStatus('Please add a valid slug before saving.')
       return
     }
 
+    const requestedLooksLikeLegacyDefault = requestedSlug === 'new-dashboard'
+
+    const existingSlugs = new Set(savedDashboards.map((entry) => entry.slug))
+    const uniqueSlug = requestedLooksLikeLegacyDefault
+      ? ensureUniqueDashboardSlug(existingSlugs, hasSavedToGithub ? dashboardSlug : null)
+      : ensureUniqueSlug(
+          requestedSlug,
+          existingSlugs,
+          hasSavedToGithub ? dashboardSlug : null,
+        )
+    const slugWasAdjusted = uniqueSlug !== requestedSlug
+
     setIsSaving(true)
     setSaveStatus('Saving dashboard...')
 
-    const payload = toSavedLayout(cleanSlug, dashboardTitle, layout, items, datasets)
+    const payload = toSavedLayout(uniqueSlug, dashboardTitle, layout, items, datasets)
     const updatedSavedDashboards = upsertSavedLayout(payload, savedDashboards)
     setSavedDashboards(updatedSavedDashboards)
     writeSavedLayoutsToStorage(updatedSavedDashboards)
-    setDashboardSlug(cleanSlug)
+    setDashboardSlug(uniqueSlug)
     setIsDirty(false)
 
     try {
-      const path = await saveDashboardLayout(payload)
-      setSaveStatus(`Saved locally and to ${path}`)
+      const result = await saveDashboardLayout(payload)
+      const commitRef = result.commitSha ? result.commitSha.slice(0, 7) : 'unknown'
+      const slugAdjustmentMessage = slugWasAdjusted
+        ? requestedLooksLikeLegacyDefault
+          ? `Generated unique slug ${uniqueSlug}.`
+          : 'Slug adjusted to avoid conflict.'
+        : ''
+      setSaveStatus(`Saved to ${result.path} (${commitRef})${slugAdjustmentMessage ? ` ${slugAdjustmentMessage}` : ''}`)
       setHasSavedToGithub(true)
+      setGithubSyncStatus(`GitHub commit ${commitRef} updated ${result.path}`)
+      setLastGithubSyncAt(new Date().toISOString())
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to save dashboard to GitHub'
       setSaveStatus(`Saved locally. GitHub sync failed: ${message}`)
@@ -907,25 +1121,24 @@ function App() {
   }
 
   const openPreview = (slug: string) => {
+    setPreviewDashboardOverride(null)
     setActivePreviewSlug(slug)
     setEmbedStatus('')
     setViewMode('preview')
   }
 
   const openPreviewForCurrent = () => {
-    const cleanSlug = slugify(dashboardSlug)
-    if (!cleanSlug) {
-      setSaveStatus('Save this dashboard first to preview it as a user.')
+    if (!canPreviewCurrent) {
+      setSaveStatus('Add at least one widget before opening preview.')
       return
     }
 
-    const existing = savedDashboards.find((entry) => entry.slug === cleanSlug)
-    if (!existing) {
-      setSaveStatus('Save this dashboard first to preview it as a user.')
-      return
-    }
-
-    openPreview(existing.slug)
+    const cleanSlug = slugify(dashboardSlug) || 'preview-dashboard'
+    const previewLayout = toSavedLayout(cleanSlug, dashboardTitle, layout, items, datasets)
+    setPreviewDashboardOverride(previewLayout)
+    setActivePreviewSlug(null)
+    setEmbedStatus('')
+    setViewMode('preview')
   }
 
   const handleDownloadYaml = () => {
@@ -976,6 +1189,13 @@ function App() {
     event.target.value = ''
   }
 
+  const openImportYamlPicker = () => {
+    setIsActionsMenuOpen(false)
+    window.setTimeout(() => {
+      importYamlInputRef.current?.click()
+    }, 0)
+  }
+
   const handleCopyEmbedLink = async (slug: string) => {
     setIsCreatingEmbed(true)
     setEmbedStatus('')
@@ -987,6 +1207,41 @@ function App() {
       setEmbedStatus(error instanceof Error ? error.message : 'Failed to generate embed URL')
     } finally {
       setIsCreatingEmbed(false)
+    }
+  }
+
+  const handleDeleteSavedDashboard = async (slug: string, title: string) => {
+    const confirmed = window.confirm(
+      `Are you sure you want to delete "${title}"? This removes the saved dashboard locally and from GitHub.`,
+    )
+
+    if (!confirmed) {
+      return
+    }
+
+    const nextSavedDashboards = savedDashboards.filter((dashboard) => dashboard.slug !== slug)
+    setSavedDashboards(nextSavedDashboards)
+    writeSavedLayoutsToStorage(nextSavedDashboards)
+
+    if (activePreviewSlug === slug && viewMode === 'preview' && !previewDashboardOverride) {
+      setActivePreviewSlug(null)
+      setViewMode('catalog')
+    }
+
+    if (dashboardSlug === slug) {
+      setHasSavedToGithub(false)
+    }
+
+    setEmbedStatus('')
+    setSaveStatus(`Deleted ${title} locally`)
+
+    try {
+      await deleteDashboardLayout(slug)
+      setGithubSyncStatus(`Deleted dashboards/${slug}/dashboard.yaml from GitHub`)
+      setLastGithubSyncAt(new Date().toISOString())
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown GitHub delete error'
+      setGithubSyncStatus(`Local delete complete, but GitHub delete failed: ${message}`)
     }
   }
 
@@ -1150,77 +1405,158 @@ function App() {
 
   return (
     <div className="min-h-screen overflow-hidden bg-[#f5f7fb] text-slate-900">
-      <header className="flex min-h-[56px] items-center justify-between border-b border-slate-200 bg-white px-4">
+      <header className="flex min-h-[56px] items-center justify-between gap-3 border-b border-slate-200 bg-white px-4">
         <div className="flex min-w-0 items-center gap-3">
           <PanelLeft className="h-4 w-4 text-slate-500" />
-          <div className="dbx-title-editor flex min-w-0 items-center rounded-lg border border-slate-200 bg-slate-50/85 px-2 py-1.5 transition hover:border-slate-300 hover:bg-white focus-within:border-sky-300 focus-within:bg-white focus-within:shadow-[0_0_0_3px_rgba(224,242,254,0.9)]">
-            <input
-              aria-label="Dashboard title"
-              className="dbx-title-input"
-              onChange={(event) => {
-                const value = event.target.value
-                setDashboardTitle(value)
-                setDashboardSlug(slugify(value))
-                setIsDirty(true)
-              }}
-              placeholder="Dashboard title"
-              value={dashboardTitle}
-            />
-            <span className="dbx-title-hint pointer-events-none" aria-hidden="true">
-              <Pencil className="h-3.5 w-3.5" />
-            </span>
-          </div>
+          {viewMode === 'builder' ? (
+            <div className="dbx-title-editor flex min-w-0 items-center rounded-lg border border-slate-200 bg-slate-50/85 px-2 py-1.5 transition hover:border-slate-300 hover:bg-white focus-within:border-sky-300 focus-within:bg-white focus-within:shadow-[0_0_0_3px_rgba(224,242,254,0.9)]">
+              <input
+                aria-label="Dashboard title"
+                className="dbx-title-input"
+                onChange={(event) => {
+                  const value = event.target.value
+                  setDashboardTitle(value)
+                  setIsDirty(true)
+                }}
+                placeholder="Dashboard title"
+                value={dashboardTitle}
+              />
+              <span className="dbx-title-hint pointer-events-none" aria-hidden="true">
+                <Pencil className="h-3.5 w-3.5" />
+              </span>
+            </div>
+          ) : (
+            <div className="min-w-0">
+              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">
+                {viewMode === 'catalog' ? 'Dashboards' : 'Preview'}
+              </p>
+              <p className="truncate text-lg font-semibold text-slate-900">
+                {viewMode === 'preview' ? (activePreviewDashboard?.title ?? 'Dashboard Preview') : 'Dashboard Catalog'}
+              </p>
+            </div>
+          )}
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <Button
-            onClick={() => setViewMode('catalog')}
-            size="sm"
-            variant={viewMode === 'catalog' ? 'default' : 'outline'}
+        <motion.div
+          className="flex max-w-[65vw] shrink-0 items-center gap-2 overflow-x-auto py-1"
+          layout
+          transition={{ duration: 0.2, ease: 'easeOut' }}
+        >
+          <motion.div
+            className="dbx-header-mode-group flex items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 p-1"
+            layout
           >
-            <LayoutGrid className="mr-1 h-4 w-4" />
-            Dashboards
-          </Button>
+            <Button
+              onClick={() => setViewMode('catalog')}
+              size="sm"
+              variant={viewMode === 'catalog' ? 'default' : 'ghost'}
+            >
+              <LayoutGrid className="mr-1 h-4 w-4" />
+              Dashboards
+            </Button>
+              <Button
+                disabled={!canPreviewCurrent}
+                onClick={openPreviewForCurrent}
+              size="sm"
+              variant={viewMode === 'preview' ? 'default' : 'ghost'}
+            >
+              <Eye className="mr-1 h-4 w-4" />
+              Preview
+            </Button>
+            <Button
+              onClick={() => setViewMode('builder')}
+              size="sm"
+              variant={viewMode === 'builder' ? 'default' : 'ghost'}
+            >
+              Builder
+            </Button>
+          </motion.div>
+
           <Button
-            disabled={!hasSavedCurrentDashboard}
-            onClick={openPreviewForCurrent}
+            disabled={isSyncingFromGithub}
+            onClick={() => {
+              void syncDashboardsFromGithub(true)
+            }}
             size="sm"
-            variant={viewMode === 'preview' ? 'default' : 'outline'}
+            variant="ghost"
           >
-            <Eye className="mr-1 h-4 w-4" />
-            Preview
-          </Button>
-          <Button
-            onClick={() => setViewMode('builder')}
-            size="sm"
-            variant={viewMode === 'builder' ? 'default' : 'outline'}
-          >
-            Builder
-          </Button>
-          <Button size="sm" variant="ghost">
-            <RefreshCw className="h-4 w-4" />
+            <RefreshCw className={`h-4 w-4 ${isSyncingFromGithub ? 'animate-spin' : ''}`} />
             <span className="ml-1">Refresh</span>
           </Button>
+
           <Button className="gap-2" disabled={isSaving} onClick={handleSave} size="sm">
             <Save className="h-4 w-4" />
             {isSaving ? 'Saving...' : 'Save'}
           </Button>
-          <Button onClick={handleDownloadYaml} size="sm" variant="outline">
-            Export YAML
-          </Button>
-          <label className="inline-flex">
-            <input accept=".yaml,.yml" className="hidden" onChange={handleImportYaml} type="file" />
-            <span className="inline-flex items-center justify-center rounded-md border border-slate-300 px-3 text-sm font-medium shadow-xs transition-colors hover:bg-slate-100">
-              Import YAML
-            </span>
-          </label>
-          <Button
-            disabled={!hasSavedToGithub || isDirty}
-            size="sm"
-            variant="outline"
-          >
-            Publish
-          </Button>
-        </div>
+
+          <Popover.Root onOpenChange={setIsActionsMenuOpen} open={isActionsMenuOpen}>
+            <Popover.Trigger asChild>
+              <Button aria-expanded={isActionsMenuOpen} aria-haspopup="menu" size="sm" variant="outline">
+                File
+                <motion.span
+                  animate={{ rotate: isActionsMenuOpen ? 180 : 0 }}
+                  className="ml-1 inline-flex"
+                  transition={{ duration: 0.16, ease: 'easeOut' }}
+                >
+                  <ChevronDown className="h-4 w-4" />
+                </motion.span>
+              </Button>
+            </Popover.Trigger>
+            <Popover.Portal>
+              <AnimatePresence>
+                {isActionsMenuOpen ? (
+                  <Popover.Content align="end" asChild side="bottom" sideOffset={8}>
+                    <motion.div
+                      animate={{ opacity: 1, scale: 1, y: 0 }}
+                      className="dbx-header-menu z-40 w-44 rounded-lg border border-slate-200 bg-white p-1.5 shadow-lg"
+                      exit={{ opacity: 0, scale: 0.98, y: -6 }}
+                      initial={{ opacity: 0, scale: 0.98, y: -6 }}
+                      role="menu"
+                      transformTemplate={({ scale }) => `scale(${scale ?? 1})`}
+                      transition={{ duration: 0.14, ease: 'easeOut' }}
+                    >
+                      <button
+                        className="dbx-header-menu-item"
+                        onClick={() => {
+                          setIsActionsMenuOpen(false)
+                          handleDownloadYaml()
+                        }}
+                        role="menuitem"
+                        type="button"
+                      >
+                        Export YAML
+                      </button>
+                      <button
+                        className="dbx-header-menu-item"
+                        onClick={openImportYamlPicker}
+                        role="menuitem"
+                        type="button"
+                      >
+                        Import YAML
+                      </button>
+                      <button
+                        className="dbx-header-menu-item"
+                        disabled={!hasSavedToGithub || isDirty}
+                        onClick={() => setIsActionsMenuOpen(false)}
+                        role="menuitem"
+                        type="button"
+                      >
+                        Publish
+                      </button>
+                    </motion.div>
+                  </Popover.Content>
+                ) : null}
+              </AnimatePresence>
+            </Popover.Portal>
+          </Popover.Root>
+
+          <input
+            accept=".yaml,.yml"
+            className="hidden"
+            onChange={handleImportYaml}
+            ref={importYamlInputRef}
+            type="file"
+          />
+        </motion.div>
       </header>
 
       {viewMode === 'builder' ? (
@@ -1288,7 +1624,16 @@ function App() {
                       <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
                         Datasets
                       </h3>
-                      <Button onClick={() => setShowDatasetEditor(true)} size="sm" variant="ghost">
+                      <Button
+                        onClick={() => {
+                          setDatasetStatus('')
+                          setDatasetPreviewSql('')
+                          setHasRunDatasetPreview(false)
+                          setShowDatasetEditor(true)
+                        }}
+                        size="sm"
+                        variant="ghost"
+                      >
                         <Plus className="h-4 w-4" />
                       </Button>
                     </div>
@@ -1298,7 +1643,7 @@ function App() {
                       <div className="mt-3 space-y-2">
                         {datasets.map((dataset) => (
                           <div
-                            className="rounded-lg border border-slate-200 bg-white px-3 py-2.5 shadow-[0_1px_2px_rgba(15,23,42,0.04)]"
+                            className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-left shadow-[0_1px_2px_rgba(15,23,42,0.04)]"
                             key={dataset.id}
                           >
                             <div className="flex items-center justify-between">
@@ -1722,6 +2067,17 @@ function App() {
                         </option>
                       ))}
                     </select>
+                    {selectedItem.props.datasetId ? (
+                      selectedDatasetError ? (
+                        <p className="mt-1 text-xs text-red-600">{selectedDatasetError}</p>
+                      ) : datasetFieldNames.length === 0 ? (
+                        <p className="mt-1 text-xs text-slate-500">
+                          {selectedDatasetLoading ? 'Loading fields from query...' : 'No fields found for this dataset.'}
+                        </p>
+                      ) : (
+                        <p className="mt-1 text-xs text-slate-500">{datasetFieldNames.length} field(s) available.</p>
+                      )
+                    ) : null}
                   </div>
 
                   {selectedItem.type === 'line-chart' ? (
@@ -1738,9 +2094,9 @@ function App() {
                           value={selectedItem.props.coordinates.xField ?? ''}
                         >
                           <option value="">Select field</option>
-                          {datasetColumns.map((column) => (
-                            <option key={column.name} value={column.name}>
-                              {column.name}
+                          {datasetFieldNames.map((columnName) => (
+                            <option key={columnName} value={columnName}>
+                              {columnName}
                             </option>
                           ))}
                         </select>
@@ -1758,9 +2114,9 @@ function App() {
                           value={selectedItem.props.coordinates.yField ?? ''}
                         >
                           <option value="">Select field</option>
-                          {datasetColumns.map((column) => (
-                            <option key={column.name} value={column.name}>
-                              {column.name}
+                          {datasetFieldNames.map((columnName) => (
+                            <option key={columnName} value={columnName}>
+                              {columnName}
                             </option>
                           ))}
                         </select>
@@ -1778,9 +2134,9 @@ function App() {
                           value={selectedItem.props.coordinates.colorField ?? ''}
                         >
                           <option value="">None</option>
-                          {datasetColumns.map((column) => (
-                            <option key={column.name} value={column.name}>
-                              {column.name}
+                          {datasetFieldNames.map((columnName) => (
+                            <option key={columnName} value={columnName}>
+                              {columnName}
                             </option>
                           ))}
                         </select>
@@ -1801,9 +2157,9 @@ function App() {
                         value={selectedItem.props.coordinates.valueField ?? ''}
                       >
                         <option value="">Select field</option>
-                        {datasetColumns.map((column) => (
-                          <option key={column.name} value={column.name}>
-                            {column.name}
+                        {datasetFieldNames.map((columnName) => (
+                          <option key={columnName} value={columnName}>
+                            {columnName}
                           </option>
                         ))}
                       </select>
@@ -1812,65 +2168,172 @@ function App() {
 
                   {selectedItem.type === 'data-table' ? (
                     <div className="space-y-3">
-                      <p className="text-xs text-slate-500">
-                        Pick up to three columns to focus the table. Leave blank to show all columns.
-                      </p>
                       <div>
-                        <label className="mb-1 block text-sm font-semibold text-slate-700">Column 1</label>
-                        <select
-                          className="dbx-field"
-                          onChange={(event) => {
-                            startFormEditing()
-                            updateCoordinate('xField', event.target.value)
-                          }}
-                          onBlur={endFormEditing}
-                          value={selectedItem.props.coordinates.xField ?? ''}
-                        >
-                          <option value="">All columns</option>
-                          {datasetColumns.map((column) => (
-                            <option key={column.name} value={column.name}>
-                              {column.name}
-                            </option>
-                          ))}
-                        </select>
+                        <label className="mb-1 block text-sm font-semibold text-slate-700">Add columns</label>
+                        <div className="max-h-36 space-y-1 overflow-auto rounded-lg border border-slate-200 bg-white p-2">
+                          {datasetFieldNames.length === 0 ? (
+                            <p className="text-xs text-slate-500">No fields available.</p>
+                          ) : (
+                            datasetFieldNames.map((columnName) => {
+                              const checked = selectedTableColumns.includes(columnName)
+                              return (
+                                <label
+                                  className="flex items-center gap-2 rounded px-1 py-1 text-sm text-slate-700 hover:bg-slate-50"
+                                  key={`column-toggle-${columnName}`}
+                                >
+                                  <input
+                                    checked={checked}
+                                    onChange={(event) => {
+                                      startFormEditing()
+                                      const nextColumns = event.target.checked
+                                        ? mergeUniqueColumns([...selectedTableColumns, columnName])
+                                        : selectedTableColumns.filter((entry) => entry !== columnName)
+                                      updateSelected(
+                                        {
+                                          coordinates: {
+                                            ...selectedItem.props.coordinates,
+                                            tableColumns: nextColumns,
+                                          },
+                                        },
+                                        false,
+                                      )
+                                      endFormEditing()
+                                    }}
+                                    type="checkbox"
+                                  />
+                                  <span className="inline-flex h-5 w-5 items-center justify-center rounded border border-slate-200 bg-slate-50 text-[10px] font-semibold text-slate-500">
+                                    {getFieldTypeLabel(
+                                      datasetColumns.find((column) => column.name === columnName)?.type ?? 'STRING',
+                                    )}
+                                  </span>
+                                  <span className="truncate">{columnName}</span>
+                                </label>
+                              )
+                            })
+                          )}
+                        </div>
                       </div>
-                      <div>
-                        <label className="mb-1 block text-sm font-semibold text-slate-700">Column 2</label>
-                        <select
-                          className="dbx-field"
-                          onChange={(event) => {
-                            startFormEditing()
-                            updateCoordinate('yField', event.target.value)
-                          }}
-                          onBlur={endFormEditing}
-                          value={selectedItem.props.coordinates.yField ?? ''}
-                        >
-                          <option value="">None</option>
-                          {datasetColumns.map((column) => (
-                            <option key={column.name} value={column.name}>
-                              {column.name}
-                            </option>
-                          ))}
-                        </select>
+
+                      <div className="flex items-center justify-between">
+                        <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Columns</p>
+                        <span className="text-xs text-slate-500">{selectedTableColumns.length} selected</span>
                       </div>
-                      <div>
-                        <label className="mb-1 block text-sm font-semibold text-slate-700">Column 3</label>
-                        <select
-                          className="dbx-field"
-                          onChange={(event) => {
+
+                      <div className="space-y-1.5 rounded-lg border border-slate-200 bg-slate-50/40 p-2">
+                        {selectedTableColumns.length === 0 ? (
+                          <p className="px-1 py-1 text-xs text-slate-500">
+                            No columns selected. Table currently shows all dataset fields.
+                          </p>
+                        ) : (
+                          selectedTableColumns.map((columnName, columnIndex) => (
+                            <div
+                              className="flex items-center justify-between rounded-md border border-slate-200 bg-white px-2 py-1.5"
+                              draggable
+                              key={columnName}
+                              onDragOver={(event) => {
+                                event.preventDefault()
+                              }}
+                              onDragStart={() => {
+                                setDraggingTableColumn(columnName)
+                              }}
+                              onDrop={() => {
+                                if (!draggingTableColumn || draggingTableColumn === columnName) {
+                                  return
+                                }
+                                startFormEditing()
+                                const sourceIndex = selectedTableColumns.indexOf(draggingTableColumn)
+                                if (sourceIndex < 0) {
+                                  return
+                                }
+                                const nextColumns = [...selectedTableColumns]
+                                nextColumns.splice(sourceIndex, 1)
+                                nextColumns.splice(columnIndex, 0, draggingTableColumn)
+                                updateSelected(
+                                  {
+                                    coordinates: {
+                                      ...selectedItem.props.coordinates,
+                                      tableColumns: nextColumns,
+                                    },
+                                  },
+                                  false,
+                                )
+                                setDraggingTableColumn(null)
+                                endFormEditing()
+                              }}
+                            >
+                              <div className="flex min-w-0 items-center gap-2">
+                                <span className="text-xs text-slate-400">::</span>
+                                <span className="inline-flex h-5 w-5 items-center justify-center rounded border border-slate-200 bg-slate-50 text-[10px] font-semibold text-slate-500">
+                                  {getFieldTypeLabel(
+                                    datasetColumns.find((column) => column.name === columnName)?.type ?? 'STRING',
+                                  )}
+                                </span>
+                                <span className="truncate text-sm text-slate-700">{columnName}</span>
+                              </div>
+                              <button
+                                className="rounded px-1.5 py-0.5 text-xs text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
+                                onClick={() => {
+                                  startFormEditing()
+                                  const nextColumns = selectedTableColumns.filter((entry) => entry !== columnName)
+                                  updateSelected(
+                                    {
+                                      coordinates: {
+                                        ...selectedItem.props.coordinates,
+                                        tableColumns: nextColumns,
+                                      },
+                                    },
+                                    false,
+                                  )
+                                  endFormEditing()
+                                }}
+                                type="button"
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          ))
+                        )}
+                      </div>
+
+                      <div className="flex items-center justify-between">
+                        <button
+                          className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-600 transition hover:border-slate-300 hover:bg-slate-50"
+                          onClick={() => {
                             startFormEditing()
-                            updateCoordinate('colorField', event.target.value)
+                            updateSelected(
+                              {
+                                coordinates: {
+                                  ...selectedItem.props.coordinates,
+                                  tableColumns: datasetFieldNames,
+                                },
+                              },
+                              false,
+                            )
+                            endFormEditing()
                           }}
-                          onBlur={endFormEditing}
-                          value={selectedItem.props.coordinates.colorField ?? ''}
+                          type="button"
                         >
-                          <option value="">None</option>
-                          {datasetColumns.map((column) => (
-                            <option key={column.name} value={column.name}>
-                              {column.name}
-                            </option>
-                          ))}
-                        </select>
+                          Add all remaining
+                        </button>
+                        <button
+                          className="rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-600 transition hover:border-slate-300 hover:bg-slate-50"
+                          onClick={() => {
+                            startFormEditing()
+                            updateSelected(
+                              {
+                                coordinates: {
+                                  ...selectedItem.props.coordinates,
+                                  tableColumns: [],
+                                },
+                              },
+                              false,
+                            )
+                            endFormEditing()
+                          }}
+                          type="button"
+                        >
+                          Clear selection
+                        </button>
                       </div>
                     </div>
                   ) : null}
@@ -1923,10 +2386,26 @@ function App() {
                 <p className="mt-1 text-sm text-slate-600">
                   Select a dashboard to edit in Builder or open full-screen user preview.
                 </p>
+                {lastGithubSyncAt ? (
+                  <p className="mt-1 text-xs text-slate-500">GitHub sync: {formatUpdatedAt(lastGithubSyncAt)}</p>
+                ) : null}
               </div>
-              <Button onClick={() => setViewMode('builder')} size="sm" variant="outline">
-                Open Builder
-              </Button>
+              <div className="flex gap-2">
+                <Button
+                  disabled={isSyncingFromGithub}
+                  onClick={() => {
+                    void syncDashboardsFromGithub(true)
+                  }}
+                  size="sm"
+                  variant="outline"
+                >
+                  <RefreshCw className={`mr-1 h-4 w-4 ${isSyncingFromGithub ? 'animate-spin' : ''}`} />
+                  Sync from GitHub
+                </Button>
+                <Button onClick={() => setViewMode('builder')} size="sm" variant="outline">
+                  Open Builder
+                </Button>
+              </div>
             </div>
 
             {savedDashboards.length === 0 ? (
@@ -1958,32 +2437,43 @@ function App() {
                         {dashboard.datasets.length} dataset{dashboard.datasets.length === 1 ? '' : 's'}
                       </span>
                     </div>
-                    <div className="mt-4 flex gap-2">
+                    <div className="mt-4 space-y-2">
+                      <div className="flex gap-2">
+                        <Button
+                          className="flex-1"
+                          onClick={() => loadDashboardIntoBuilder(dashboard)}
+                          size="sm"
+                          variant="outline"
+                        >
+                          Edit
+                        </Button>
+                        <Button
+                          className="flex-1"
+                          onClick={() => openPreview(dashboard.slug)}
+                          size="sm"
+                        >
+                          <Eye className="mr-1 h-4 w-4" />
+                          Preview
+                        </Button>
+                        <Button
+                          className="flex-1"
+                          disabled={isCreatingEmbed}
+                          onClick={() => handleCopyEmbedLink(dashboard.slug)}
+                          size="sm"
+                          variant="outline"
+                        >
+                          <Copy className="mr-1 h-4 w-4" />
+                          Embed
+                        </Button>
+                      </div>
                       <Button
-                        className="flex-1"
-                        onClick={() => loadDashboardIntoBuilder(dashboard)}
+                        className="w-full"
+                        onClick={() => handleDeleteSavedDashboard(dashboard.slug, dashboard.title)}
                         size="sm"
-                        variant="outline"
+                        variant="destructive"
                       >
-                        Edit
-                      </Button>
-                      <Button
-                        className="flex-1"
-                        onClick={() => openPreview(dashboard.slug)}
-                        size="sm"
-                      >
-                        <Eye className="mr-1 h-4 w-4" />
-                        Preview
-                      </Button>
-                      <Button
-                        className="flex-1"
-                        disabled={isCreatingEmbed}
-                        onClick={() => handleCopyEmbedLink(dashboard.slug)}
-                        size="sm"
-                        variant="outline"
-                      >
-                        <Copy className="mr-1 h-4 w-4" />
-                        Embed
+                        <Trash2 className="mr-1 h-4 w-4" />
+                        Delete dashboard
                       </Button>
                     </div>
                   </article>
@@ -1993,6 +2483,11 @@ function App() {
             {embedStatus ? (
               <p className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-600">
                 {embedStatus}
+              </p>
+            ) : null}
+            {githubSyncStatus ? (
+              <p className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-600">
+                {githubSyncStatus}
               </p>
             ) : null}
           </div>
@@ -2097,7 +2592,11 @@ function App() {
               </div>
               <button
                 className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
-                onClick={() => setShowDatasetEditor(false)}
+                onClick={() => {
+                  setShowDatasetEditor(false)
+                  setDatasetPreviewSql('')
+                  setHasRunDatasetPreview(false)
+                }}
                 type="button"
               >
                 <X className="h-4 w-4" />
@@ -2131,9 +2630,83 @@ function App() {
                 <textarea
                   className="dbx-field h-40"
                   id="dataset-sql"
-                  onChange={(event) => setDatasetSql(event.target.value)}
+                  onChange={(event) => {
+                    setDatasetSql(event.target.value)
+                    setHasRunDatasetPreview(false)
+                  }}
                   value={datasetSql}
                 />
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-slate-50/50 p-3">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Query preview</p>
+                  <div className="flex items-center gap-2 text-xs text-slate-600">
+                    <Button
+                      disabled={datasetPreviewLoading || !datasetSql.trim()}
+                      onClick={runDatasetPreview}
+                      size="sm"
+                      variant="outline"
+                    >
+                      {datasetPreviewLoading ? 'Running...' : 'Run'}
+                    </Button>
+                    <label htmlFor="dataset-preview-limit">Rows</label>
+                    <select
+                      className="rounded border border-slate-300 bg-white px-2 py-1 text-xs"
+                      id="dataset-preview-limit"
+                      onChange={(event) => setDatasetPreviewLimit(Number(event.target.value) || 5)}
+                      value={datasetPreviewLimit}
+                    >
+                      <option value={5}>5</option>
+                      <option value={10}>10</option>
+                      <option value={20}>20</option>
+                      <option value={50}>50</option>
+                    </select>
+                  </div>
+                </div>
+
+                {datasetPreviewError ? (
+                  <p className="text-xs text-red-600">{datasetPreviewError}</p>
+                ) : datasetPreviewLoading ? (
+                  <p className="text-xs text-slate-500">Running query preview...</p>
+                ) : !hasRunDatasetPreview ? (
+                  <p className="text-xs text-slate-500">Click Run to preview example data.</p>
+                ) : datasetPreviewColumns.length === 0 ? (
+                  <p className="text-xs text-slate-500">No columns returned yet. Update SQL to preview data.</p>
+                ) : (
+                  <div className="max-h-56 overflow-auto rounded border border-slate-200 bg-white">
+                    <table className="min-w-full text-left text-xs">
+                      <thead className="bg-slate-100 text-slate-600">
+                        <tr>
+                          {datasetPreviewColumns.map((column) => (
+                            <th className="px-2 py-1.5 font-semibold" key={column}>
+                              {column}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {datasetPreviewDisplayRows.length > 0 ? (
+                          datasetPreviewDisplayRows.map((row, rowIndex) => (
+                            <tr className="border-t border-slate-100" key={`dataset-preview-row-${rowIndex}`}>
+                              {datasetPreviewColumns.map((column) => (
+                                <td className="px-2 py-1.5 text-slate-700" key={`${rowIndex}-${column}`}>
+                                  {String(row[column] ?? '')}
+                                </td>
+                              ))}
+                            </tr>
+                          ))
+                        ) : (
+                          <tr>
+                            <td className="px-2 py-2 text-slate-500" colSpan={datasetPreviewColumns.length}>
+                              Query returned no rows.
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -2143,11 +2716,19 @@ function App() {
                 Query validation checks SQL and infers available columns.
               </div>
               <div className="flex gap-2">
-                <Button onClick={() => setShowDatasetEditor(false)} size="sm" variant="ghost">
+                <Button
+                  onClick={() => {
+                    setShowDatasetEditor(false)
+                    setDatasetPreviewSql('')
+                    setHasRunDatasetPreview(false)
+                  }}
+                  size="sm"
+                  variant="ghost"
+                >
                   Cancel
                 </Button>
-                <Button disabled={isValidatingDataset} onClick={createDataset} size="sm">
-                  {isValidatingDataset ? 'Validating...' : 'Validate and Add Dataset'}
+                <Button disabled={isValidatingDataset || !canSaveDataset} onClick={createDataset} size="sm">
+                  {isValidatingDataset ? 'Saving...' : 'Save Dataset'}
                 </Button>
               </div>
             </div>

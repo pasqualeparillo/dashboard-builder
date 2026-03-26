@@ -1,6 +1,6 @@
 import { Octokit } from 'octokit'
 
-import { toDashboardYaml } from '@/lib/dashboard-spec'
+import { parseDashboardYaml, toDashboardYaml } from '@/lib/dashboard-spec'
 import type { SavedDashboardLayout } from '@/lib/types'
 
 const owner = import.meta.env.VITE_GITHUB_OWNER as string | undefined
@@ -26,6 +26,10 @@ function assertRepoConfig() {
 
 function toBase64(content: string) {
   return btoa(unescape(encodeURIComponent(content)))
+}
+
+function fromBase64(content: string) {
+  return decodeURIComponent(escape(atob(content)))
 }
 
 export async function saveDashboardLayout(layout: SavedDashboardLayout) {
@@ -54,7 +58,7 @@ export async function saveDashboardLayout(layout: SavedDashboardLayout) {
     }
   }
 
-  await octokit.rest.repos.createOrUpdateFileContents({
+  const response = await octokit.rest.repos.createOrUpdateFileContents({
     owner: repoOwner,
     repo: repoName,
     path,
@@ -64,5 +68,114 @@ export async function saveDashboardLayout(layout: SavedDashboardLayout) {
     branch,
   })
 
-  return path
+  return {
+    path,
+    commitSha: response.data.commit.sha,
+  }
+}
+
+export async function deleteDashboardLayout(slug: string) {
+  const { owner: repoOwner, repo: repoName } = assertRepoConfig()
+  const octokit = getOctokit()
+  const path = `dashboards/${slug}/dashboard.yaml`
+
+  let sha: string | undefined
+
+  try {
+    const current = await octokit.rest.repos.getContent({
+      owner: repoOwner,
+      repo: repoName,
+      path,
+      ref: branch,
+    })
+
+    if (!Array.isArray(current.data) && 'sha' in current.data) {
+      sha = current.data.sha
+    }
+  } catch (error) {
+    const maybeStatus = error as { status?: number }
+    if (maybeStatus.status === 404) {
+      return
+    }
+    throw error
+  }
+
+  if (!sha) {
+    return
+  }
+
+  await octokit.rest.repos.deleteFile({
+    owner: repoOwner,
+    repo: repoName,
+    path,
+    message: `Delete dashboard spec ${slug}`,
+    sha,
+    branch,
+  })
+}
+
+export async function listDashboardLayoutsFromGithub(): Promise<SavedDashboardLayout[]> {
+  const { owner: repoOwner, repo: repoName } = assertRepoConfig()
+  const octokit = getOctokit()
+
+  let entries:
+    | Array<{
+        type?: string
+        path?: string
+      }>
+    | null = null
+
+  try {
+    const response = await octokit.rest.repos.getContent({
+      owner: repoOwner,
+      repo: repoName,
+      path: 'dashboards',
+      ref: branch,
+    })
+
+    if (Array.isArray(response.data)) {
+      entries = response.data.map((entry) => ({
+        type: entry.type,
+        path: entry.path,
+      }))
+    }
+  } catch (error) {
+    const maybeStatus = error as { status?: number }
+    if (maybeStatus.status === 404) {
+      return []
+    }
+    throw error
+  }
+
+  if (!entries) {
+    return []
+  }
+
+  const yamlPaths = entries
+    .filter((entry) => entry.type === 'dir' && typeof entry.path === 'string')
+    .map((entry) => `${entry.path}/dashboard.yaml`)
+
+  const fetched = await Promise.all(
+    yamlPaths.map(async (path) => {
+      try {
+        const response = await octokit.rest.repos.getContent({
+          owner: repoOwner,
+          repo: repoName,
+          path,
+          ref: branch,
+        })
+
+        if (Array.isArray(response.data) || !('content' in response.data)) {
+          return null
+        }
+
+        const decoded = fromBase64(response.data.content.replace(/\n/g, ''))
+        return parseDashboardYaml(decoded)
+      } catch {
+        return null
+      }
+    }),
+  )
+
+  return fetched.filter((entry): entry is SavedDashboardLayout => entry !== null)
 }

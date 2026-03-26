@@ -79,11 +79,7 @@ export function renderVisualization(item: DashboardItem, datasets: DatasetDefini
   }
 
   if (item.type === 'data-table') {
-    const visibleColumns = [
-      item.props.coordinates.xField,
-      item.props.coordinates.yField,
-      item.props.coordinates.colorField,
-    ].filter(Boolean) as string[]
+    const visibleColumns = item.props.coordinates.tableColumns ?? []
 
     return (
       <DataTableViz
